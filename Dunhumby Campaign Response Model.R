@@ -97,3 +97,5 @@ model_logit <- glm(coupon_used ~
                    family = binomial(link = "logit"))
 
 summary(model_logit)
+
+#practice committing changes
