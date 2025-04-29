@@ -1,0 +1,549 @@
+---
+title: "Dunhumby Explore_User Responde Model"
+output: html_document
+date: "2025-04-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+1. Load the dataset
+```{r}
+# Load libraries
+library(tidyverse)
+
+# Set data path
+data_path <- "/Users/shimuliu/Desktop/First-year Paper/archive"
+
+# Load datasets
+campaign_desc       <- read_csv(file.path(data_path, "campaign_desc.csv"))
+campaign_table      <- read_csv(file.path(data_path, "campaign_table.csv"))
+causal_data         <- read_csv(file.path(data_path, "causal_data.csv"))
+coupon_redempt      <- read_csv(file.path(data_path, "coupon_redempt.csv"))
+coupon              <- read_csv(file.path(data_path, "coupon.csv"))
+hh_demographic      <- read_csv(file.path(data_path, "hh_demographic.csv"))
+product             <- read_csv(file.path(data_path, "product.csv"))
+transaction_data    <- read_csv(file.path(data_path, "transaction_data.csv"))
+```
+2.Join transaction and product tables
+```{r}
+# Join transaction with product information
+transaction_with_product <- transaction_data %>%
+  left_join(product, by = "PRODUCT_ID")
+
+#check unknowns
+sum(is.na(transaction_with_product$DEPARTMENT))
+colSums(is.na(transaction_with_product))
+
+#Replace unkown department with NA
+transaction_with_product <- transaction_with_product %>%
+  mutate(DEPARTMENT = ifelse(is.na(DEPARTMENT), "Unknown", DEPARTMENT))
+
+#Replace unknown COMMODITY_DESC with NA
+transaction_with_product <- transaction_with_product %>%
+  mutate(COMMODITY_DESC = ifelse(is.na(COMMODITY_DESC), "Unknown", COMMODITY_DESC))
+
+#Replace SUB_COMMODITY_DESC with NA
+transaction_with_product <- transaction_with_product %>%
+  mutate(SUB_COMMODITY_DESC = ifelse(is.na(SUB_COMMODITY_DESC), "Unknown", SUB_COMMODITY_DESC))
+
+```
+7839 missing values in DEPARTMENT, COMMODITY_DESC and SUB_COMMODITY_DESC. 
+
+3. Compute total sales of each department (sales in dollars)
+```{r}
+#Create a new dataset to store department sales
+department_sales <- transaction_with_product %>%
+  group_by(DEPARTMENT) %>%
+  summarise(TOTAL_DEPARTMENT_SALES = sum(SALES_VALUE, na.rm = TRUE)) %>%
+  arrange(desc(TOTAL_DEPARTMENT_SALES))
+
+# Summarize the department names only
+department_summary <- transaction_with_product %>%
+  count(DEPARTMENT, sort = TRUE)
+
+# View the result
+print(department_summary)
+
+#Inspect
+summary(department_sales)
+head(department_sales, 10)
+```
+
+4. Pick a category with high sales
+```{r}
+# Select a department with high sales
+top_10_departments <- department_sales %>%
+  arrange(desc(TOTAL_DEPARTMENT_SALES)) %>%
+  slice_head(n = 10)
+
+# View result
+print(top_10_departments)
+```
+Grocery department has the highest sales, followed by Produce and Frozen Foods.
+
+5. Find the brand with th highest sales
+```{r}
+
+# 1. Filter for only Grocery department
+grocery_data <- transaction_with_product %>%
+  filter(DEPARTMENT == "GROCERY")
+
+# 2. Group by BRAND and summarize total sales
+brand_sales_in_grocery <- grocery_data %>%
+  group_by(BRAND) %>%
+  summarise(TOTAL_BRAND_SALES = sum(SALES_VALUE, na.rm = TRUE)) %>%
+  arrange(desc(TOTAL_BRAND_SALES))
+
+# 3. Pick the top brand
+top_brand_in_grocery <- brand_sales_in_grocery %>%
+  slice_head(n = 5)
+
+# View the result
+print(top_brand_in_grocery)
+
+```
+
+
+6. Find the SUB_COMMODITY_DESC with the highest sales in the Grocery department
+```{r}
+# 1. Filter for only Grocery department
+grocery_data <- transaction_with_product %>%
+  filter(DEPARTMENT == "GROCERY")
+
+# 2. Group by BRAND and summarize total sales
+commodity_desc_sales_in_grocery <- grocery_data %>%
+  group_by(SUB_COMMODITY_DESC) %>%
+  summarise(SUB_COMMODITY_DESC_SALES = sum(SALES_VALUE, na.rm = TRUE)) %>%
+  arrange(desc(SUB_COMMODITY_DESC_SALES))
+
+# 3. Pick the top brand
+top_commodity_in_grocery <- commodity_desc_sales_in_grocery %>%
+  slice_head(n = 5)
+
+# View the result
+print(commodity_desc_sales_in_grocery)
+```
+The top two sub-commodities in the grocery department is FLUID MILK WHITE ONLY and SOFT DRINKS 12/18&15PK CAN CAR. 
+
+7. Check if the top sub-commodities have ads presented
+```{r}
+# 1. Get all PRODUCT_IDs belonging to that SUB_COMMODITY_DESC
+top_commodity_products <- transaction_with_product %>%
+  filter(DEPARTMENT == "GROCERY", SUB_COMMODITY_DESC == "FLUID MILK WHITE ONLY") %>% 
+  distinct(PRODUCT_ID)
+
+# 2.From causal_data, filter only those products
+top_commodity_causal <- causal_data %>%
+  filter(PRODUCT_ID %in% top_commodity_products$PRODUCT_ID)
+
+# 3. Summarize number of different displays
+display_summary <- top_commodity_causal %>%
+  count(display, sort = TRUE)
+
+print(display_summary)
+
+# 4. Summarize number of different mailers
+mailer_summary <- top_commodity_causal %>%
+  count(mailer, sort = TRUE)
+
+print(mailer_summary)
+```
+8. Prepare the data for user-level sales response model
+Y_{ist} = sales of "FLUID MILK WHITE ONLY" to household i in store s in week t
+X_{ist} = price to household i in store s in week t  - tricky what price did they face when they don’t buy?
+        display
+        mailer
+        coupon
+      
+8.a.Set target sub-commodity "FLUID MILK WHITE ONLY"
+```{r}
+target_sub_commodity <- "FLUID MILK WHITE ONLY"
+
+# Get all Product IDs under this sub-commodity
+target_products <- product %>%
+  filter(SUB_COMMODITY_DESC == target_sub_commodity) %>%
+  distinct(PRODUCT_ID)
+
+print(target_products)
+```
+
+8.b.Build the full dataset: Sales of Household * Store * Week
+```{r}
+# Get all unique households, stores, and weeks
+households <- transaction_data %>% distinct(household_key)
+stores <- transaction_data %>% distinct(STORE_ID)
+weeks <- transaction_data %>% distinct(WEEK_NO)
+
+# Expand grid: Household x Store x Week
+panel <- crossing(households, stores, weeks)
+
+print(panel)
+```
+8.c. Merge sales data
+```{r}
+# Filter transactions for target milk products
+milk_sales <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID) %>%
+  group_by(household_key, STORE_ID, WEEK_NO) %>%
+  summarise(
+    SALES_VALUE = sum(SALES_VALUE, na.rm = TRUE),
+    QUANTITY = sum(QUANTITY, na.rm = TRUE),
+    RETAIL_DISC = sum(RETAIL_DISC, na.rm = TRUE),
+    COUPON_DISC = sum(COUPON_DISC, na.rm = TRUE),
+    COUPON_MATCH_DISC = sum(COUPON_MATCH_DISC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(milk_sales)
+```
+8.d. Merge with the full panel
+```{r, eval=FALSE}
+panel <- panel %>%
+  left_join(milk_sales, by = c("household_key", "STORE_ID", "WEEK_NO")) %>%
+  mutate(
+    SALES_VALUE = replace_na(SALES_VALUE, 0),
+    QUANTITY = replace_na(QUANTITY, 0),
+    RETAIL_DISC = replace_na(RETAIL_DISC, 0),
+    COUPON_DISC = replace_na(COUPON_DISC, 0),
+    COUPON_MATCH_DISC = replace_na(COUPON_MATCH_DISC, 0)
+  )
+
+print(panel)
+
+```
+smaller left join
+```{r, eval=FALSE}
+# Loop over weeks
+for (w in weeks) {
+  cat("Processing week", w, "\n")
+  
+  panel_small <- panel %>% filter(WEEK_NO == w)
+  
+  joined_small <- panel_small %>%
+    left_join(milk_sales, by = c("household_key", "STORE_ID", "WEEK_NO"))
+  
+  # Check and add missing columns if necessary
+  if (!"SALES_VALUE" %in% names(joined_small)) joined_small$SALES_VALUE <- NA
+  if (!"QUANTITY" %in% names(joined_small)) joined_small$QUANTITY <- NA
+  if (!"RETAIL_DISC" %in% names(joined_small)) joined_small$RETAIL_DISC <- NA
+  if (!"COUPON_DISC" %in% names(joined_small)) joined_small$COUPON_DISC <- NA
+  if (!"COUPON_MATCH_DISC" %in% names(joined_small)) joined_small$COUPON_MATCH_DISC <- NA
+  
+  # Now safe to replace NA with 0
+  joined_small <- joined_small %>%
+    mutate(
+      SALES_VALUE = replace_na(SALES_VALUE, 0),
+      QUANTITY = replace_na(QUANTITY, 0),
+      RETAIL_DISC = replace_na(RETAIL_DISC, 0),
+      COUPON_DISC = replace_na(COUPON_DISC, 0),
+      COUPON_MATCH_DISC = replace_na(COUPON_MATCH_DISC, 0)
+    )
+  
+  result_list[[as.character(w)]] <- joined_small
+}
+
+# After all weeks processed, bind them together
+panel_final <- bind_rows(result_list)
+head(panel_final)
+```
+sampling a subset only 500 households
+```{r}
+# Set seed 
+set.seed(123)
+
+# Sample 500 households (you can change this number if needed)
+households_small <- households %>% sample_n(500)
+
+# Expand grid: Household x Store x Week (only sampled households)
+panel_small <- crossing(households_small, stores, weeks)
+
+# Check size
+print(dim(panel_small))
+```
+```{r}
+# Merge the small panel with milk sales
+panel_small_joined <- panel_small %>%
+  left_join(milk_sales, by = c("household_key", "STORE_ID", "WEEK_NO"))
+
+# Replace NAs with 0s
+needed_cols <- c("SALES_VALUE", "QUANTITY", "RETAIL_DISC", "COUPON_DISC", "COUPON_MATCH_DISC") 
+panel_small_joined <- panel_small_joined %>%
+  mutate(across(all_of(needed_cols), ~replace_na(., 0)))
+
+# Check
+summary(panel_small_joined)
+
+```
+
+8.e. Merge with price data (replace NAs with store average price at that week if a sale has happened in that store at that week, then NAs with average store price during all periods if no sales happened during that week but at other weeks, and drop stores with no sales at all bcs it means that store does not sell milk)
+```{r}
+# Compute average price at each store-week (across all milk buyers)
+avg_price_store_week <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID, QUANTITY > 0) %>%
+  mutate(unit_price = SALES_VALUE / QUANTITY) %>%
+  group_by(STORE_ID, WEEK_NO) %>%
+  summarise(avg_price = mean(unit_price, na.rm = TRUE), .groups = "drop")
+
+# Preview
+print(head(avg_price_store_week))
+```
+```{r}
+# Compute overall store-level average price 
+avg_price_store <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID, QUANTITY > 0) %>%
+  mutate(unit_price = SALES_VALUE / QUANTITY) %>%
+  group_by(STORE_ID) %>%
+  summarise(store_avg_price = mean(unit_price, na.rm = TRUE), .groups = "drop")
+
+print(head(avg_price_store))
+```
+```{r}
+# Merge store-week avg price into panel 
+panel_small_joined <- panel_small_joined %>%
+  left_join(avg_price_store_week, by = c("STORE_ID", "WEEK_NO"))
+
+# Merge overall store avg price into panel 
+panel_small_joined <- panel_small_joined %>%
+  left_join(avg_price_store, by = "STORE_ID")
+
+# Fill missing avg price: first store-week, then store avg 
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    avg_price_filled = coalesce(avg_price, store_avg_price)
+  )
+
+# Drop stores that have no milk sales ever
+panel_small_joined <- panel_small_joined %>%
+  filter(!is.na(avg_price_filled))
+
+# Calculate final price variable 
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    observed_price = if_else(QUANTITY > 0, SALES_VALUE / QUANTITY, NA_real_),
+    price = coalesce(observed_price, avg_price_filled)
+  )
+
+#Check 
+summary(panel_small_joined$price)
+sum(is.na(panel_small_joined$price))
+```
+
+9. Merge ad types data
+```{r}
+#From causal_data, filter only our targeted products
+causal_milk <- causal_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID)
+
+# Collapse to store-week level: if any product is displayed or mailed, mark it as 1
+causal_milk_store_week <- causal_milk %>%
+  group_by(STORE_ID, WEEK_NO) %>%
+  summarise(
+    display = max(display, na.rm = TRUE),
+    mailer = max(mailer, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Preview
+print(causal_milk_store_week)
+```
+```{r}
+#Merge into main
+panel_small_joined <- panel_small_joined %>%
+  left_join(causal_milk_store_week, by = c("STORE_ID", "WEEK_NO"))
+
+#Replace NAs with 0 (is this reasonable?)
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    display = if_else(is.na(display), "0", as.character(display)),
+    mailer = if_else(is.na(mailer), "0", as.character(mailer))
+  )
+
+#Check
+panel_small_joined %>%
+  filter(STORE_ID == 286, WEEK_NO %in% c(9, 11, 13, 14,21)) %>%
+  select(display, mailer)
+```
+
+10. User response Model
+Yist = SALES_VALUE ist
+Xist = price ist
+        display ist
+        RETAIL_DISC ist
+        COUPON_DISC ist
+        COUPON_MATCH_DISC ist
+```{r}
+#Convert to factors
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    display_cat = factor(display),
+    mailer_cat = factor(mailer)
+  )
+
+# Fit the model
+ols_model_cat <- lm(
+  SALES_VALUE ~ price + display_cat + mailer_cat +
+    RETAIL_DISC + COUPON_DISC + COUPON_MATCH_DISC,
+  data = panel_small_joined
+)
+
+options(scipen = 999)
+summary(ols_model_cat)
+
+```
+
+11. Another model at brand level ("National" vs. "Private")
+
+Prepare the data for user-level sales response model Y_{ist} = sales of “National” to household i in store s in week t X_{ist} = price to household i in store s in week t
+
+```{r}
+#.Set target sub-commodity “National”
+target_sub_commodity <- "National"
+
+# Get all Product IDs under this sub-commodity
+target_products <- product %>%
+  filter(BRAND == target_sub_commodity) %>%
+  distinct(PRODUCT_ID)
+
+print(target_products)
+```
+
+Build the full dataset: Sales of Household * Store * Week
+```{r}
+
+national_sales <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID) %>%
+  group_by(household_key, STORE_ID, WEEK_NO) %>%
+  summarise(
+    SALES_VALUE = sum(SALES_VALUE, na.rm = TRUE),
+    QUANTITY = sum(QUANTITY, na.rm = TRUE),
+    RETAIL_DISC = sum(RETAIL_DISC, na.rm = TRUE),
+    COUPON_DISC = sum(COUPON_DISC, na.rm = TRUE),
+    COUPON_MATCH_DISC = sum(COUPON_MATCH_DISC, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(national_sales)
+```
+
+Sampling 500 households
+```{r}
+# Get all unique households, stores, and weeks
+households <- transaction_data %>% distinct(household_key)
+stores <- transaction_data %>% distinct(STORE_ID)
+weeks <- transaction_data %>% distinct(WEEK_NO)
+
+# Set seed 
+set.seed(123)
+
+# Sample 500 households (you can change this number if needed)
+households_small <- households %>% sample_n(100)
+
+# Expand grid: Household x Store x Week (only sampled households)
+panel_small <- crossing(households_small, stores, weeks)
+
+# Merge the small panel with milk sales
+panel_small_joined <- panel_small %>%
+  left_join(national_sales, by = c("household_key", "STORE_ID", "WEEK_NO"))
+
+# Replace NAs with 0s
+needed_cols <- c("SALES_VALUE", "QUANTITY", "RETAIL_DISC", "COUPON_DISC", "COUPON_MATCH_DISC") 
+panel_small_joined <- panel_small_joined %>%
+  mutate(across(all_of(needed_cols), ~replace_na(., 0)))
+
+# Check
+summary(panel_small_joined)
+```
+Merge with price data
+```{r}
+# Compute average price at each store-week (across all national products buyers)
+avg_price_store_week <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID, QUANTITY > 0) %>%
+  mutate(unit_price = SALES_VALUE / QUANTITY) %>%
+  group_by(STORE_ID, WEEK_NO) %>%
+  summarise(avg_price = mean(unit_price, na.rm = TRUE), .groups = "drop")
+
+# Compute overall store-level average price 
+avg_price_store <- transaction_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID, QUANTITY > 0) %>%
+  mutate(unit_price = SALES_VALUE / QUANTITY) %>%
+  group_by(STORE_ID) %>%
+  summarise(store_avg_price = mean(unit_price, na.rm = TRUE), .groups = "drop")
+
+# Merge store-week avg price into panel 
+panel_small_joined <- panel_small_joined %>%
+  left_join(avg_price_store_week, by = c("STORE_ID", "WEEK_NO"))
+
+# Merge overall store avg price into panel 
+panel_small_joined <- panel_small_joined %>%
+  left_join(avg_price_store, by = "STORE_ID")
+
+# Fill missing avg price: first store-week, then store avg 
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    avg_price_filled = coalesce(avg_price, store_avg_price)
+  )
+
+# Drop stores that have no milk sales ever
+panel_small_joined <- panel_small_joined %>%
+  filter(!is.na(avg_price_filled))
+
+# Calculate final price variable 
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    observed_price = if_else(QUANTITY > 0, SALES_VALUE / QUANTITY, NA_real_),
+    price = coalesce(observed_price, avg_price_filled)
+  )
+
+#Check 
+summary(panel_small_joined$price)
+sum(is.na(panel_small_joined$price))
+
+
+```
+
+Merge ad types data
+```{r}
+#From causal_data, filter only our targeted products
+causal_national <- causal_data %>%
+  filter(PRODUCT_ID %in% target_products$PRODUCT_ID)
+
+# Collapse to store-week level: if any product is displayed or mailed, mark it as 1
+causal_national_store_week <- causal_national %>%
+  group_by(STORE_ID, WEEK_NO) %>%
+  summarise(
+    display = max(display, na.rm = TRUE),
+    mailer = max(mailer, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#Merge into main
+panel_small_joined <- panel_small_joined %>%
+  left_join(causal_national_store_week, by = c("STORE_ID", "WEEK_NO"))
+
+#Replace NAs with 0 (is this reasonable?)
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    display = if_else(is.na(display), "0", as.character(display)),
+    mailer = if_else(is.na(mailer), "0", as.character(mailer))
+  )
+
+#Convert to factors
+panel_small_joined <- panel_small_joined %>%
+  mutate(
+    display_cat = factor(display),
+    mailer_cat = factor(mailer)
+  )
+
+# Fit the model
+ols_model_cat <- lm(
+  SALES_VALUE ~ price + display_cat + mailer_cat +
+    RETAIL_DISC + COUPON_DISC + COUPON_MATCH_DISC,
+  data = panel_small_joined
+)
+
+options(scipen = 999)
+summary(ols_model_cat)
+```
+
