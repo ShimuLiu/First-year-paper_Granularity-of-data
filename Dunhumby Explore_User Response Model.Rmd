@@ -199,7 +199,7 @@ milk_sales <- transaction_data %>%
 print(milk_sales)
 ```
 8.d. Merge with the full panel
-```{r}
+```{r, eval=FALSE}
 panel <- panel %>%
   left_join(milk_sales, by = c("household_key", "STORE_ID", "WEEK_NO")) %>%
   mutate(
@@ -214,7 +214,7 @@ print(panel)
 
 ```
 smaller left join
-```{r}
+```{r, eval=FALSE}
 # Loop over weeks
 for (w in weeks) {
   cat("Processing week", w, "\n")
